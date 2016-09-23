@@ -7,6 +7,8 @@ var inherits = require('util').inherits
 var xml = require('xml')
 var uuid = require('uuid')
 var normalizeXHTML = require('./normalize-xhtml.js')
+var mime = require('mime-types')
+var fs = require('fs')
 
 module.exports = Streampub
 module.exports.newChapter = Chapter
@@ -19,6 +21,12 @@ var container = {container: [
     ]}
   ]}
 ]}
+
+var MIME_XHTML = 'application/xhtml+xml';
+var TYPE_COVER = 'cover';
+var TYPE_COVER_IMAGE = 'cover-image';
+var FILENAME_COVER = 'cover.xhtml';
+var FILENAME_COVER_IMAGE = 'images/cover.jpg';
 
 function Streampub (opts) {
   var self = this
@@ -46,6 +54,16 @@ function Streampub (opts) {
 }
 inherits(Streampub, Transform)
 
+// Theoretically this could be done in _flush, but somehow this generates an error
+// this is a workaround for that error ('no write after end')
+Streampub.prototype._end = Streampub.prototype.end;
+Streampub.prototype.end = function() {
+  if(this.hasCoverImage && !this.hasCover) {
+    this._generateCover(false);
+  }
+  this._end();
+}
+
 Streampub.prototype._flush = function (done) {
   var self = this
   var pkg = []
@@ -53,6 +71,10 @@ Streampub.prototype._flush = function (done) {
   pkg.push({metadata: self._generateMetadata()})
   pkg.push({manifest: self._generateManifest()})
   pkg.push({spine: self._generateSpine()})
+  if(self.hasCover) {
+    pkg.push({guide: [{reference: {_attr: {href: FILENAME_COVER, type: 'cover', title: self.meta.title || 'Cover'}}}]})
+  }
+
   self.header.then(function () {
     return self.zip.entry(xml([{'package': pkg}], {declaration: true}), {name: 'OEBPS/content.opf'})
   }).then(function () {
@@ -68,20 +90,81 @@ function Chapter (index, chapterName, fileName, content) {
   return {index: index, chapterName: chapterName, fileName: fileName, content: content}
 }
 
+Streampub.prototype._generateCover = function(async) {
+  var self = this
+  var title = self.meta.title || 'Cover'
+  function execute(callback) {
+    self.write({
+      id: TYPE_COVER,
+      fileName: FILENAME_COVER,
+      mime: MIME_XHTML,
+      content:
+        '<html><head><title>' + title + '</title></head><body style="margin: 0; padding: 0;">' +
+        '<img src="'+FILENAME_COVER_IMAGE+'" style="max-width: 100%; oeb-column-number:1;">' +
+        '</body></html>'
+    }, callback);
+  }
+
+  return async !== false ? new Promise(function(resolve, reject) {
+    execute(function(error) {
+      if(error) {
+        reject(error)
+      } else {
+        resolve()
+      }
+    })
+  }) : execute();
+}
+
 Streampub.prototype._transform = function (data, encoding, done) {
   var self = this
-  normalizeXHTML(data.content).catch(done).then(function (html) {
-    var id = ++self.maxId
-    var index = data.index || (100000 + id)
-    var fileName = data.fileName || ('streampub-chapter-' + id + '.xhtml')
-    self.chapters[index] = {index: index, chapterName: data.chapterName, fileName: fileName}
-    self.files.push({fileName: fileName, mime: 'application/xhtml+xml', id: 'file' + id})
+  var id = data.id || ++self.maxId
+  var index = data.index || (100000 + id)
+  var readPromise
+
+  if(data.id === TYPE_COVER_IMAGE) {
+    self.hasCoverImage = true;
+    data.fileName = FILENAME_COVER_IMAGE;
+  } else if(data.id === TYPE_COVER) {
+    self.hasCover = true;
+  }
+
+  data.fileName = data.fileName ||
+    (data.chapterName ? 'streampub-chapter-' + id + '.xhtml' : data.sourceFileName || 'streampub-asset-' + id)
+  data.mime = data.mime || mime.lookup(data.sourceFileName || data.fileName)
+
+  function addContent(content) {
+    if(data.chapterName) {
+      self.chapters[index] = {index: index, chapterName: data.chapterName, fileName: data.fileName}
+    }
+    self.files.push({chapterName: data.chapterName, fileName: data.fileName, mime: data.mime, id: data.id || 'file' + id})
     self.header.then(function () {
-      return self.zip.entry(html, {name: 'OEBPS/' + fileName})
-    }).finally(function () {
-      done()
+      return self.zip.entry(content, {name: 'OEBPS/' + data.fileName})
+    }).finally(done)
+  }
+
+  function readFile(fileName) {
+    return new Promise(function(resolve, reject) {
+      fs.readFile(fileName, function(err, data) {
+        if (err) {
+          reject(err)
+        } else {
+          resolve(data)
+        }
+      })
     })
-  })
+  }
+
+  if(data.sourceFileName) {
+    readPromise = readFile(data.sourceFileName)
+    if(data.mime === MIME_XHTML) {
+      readPromise = readPromise.catch(done).then(normalizeXHTML)
+    }
+  } else {
+    readPromise = normalizeXHTML(data.content)
+  }
+
+  readPromise.catch(done).then(addContent)
 }
 
 Streampub.prototype.setTitle = function (title) {
@@ -145,6 +228,9 @@ Streampub.prototype._generateMetadata = function () {
   if (this.meta.published) {
     metadata.push({'dc:date': w3cdtc(this.meta.published)})
   }
+  if(this.hasCoverImage) {
+    metadata.push({'meta': [{_attr: {name: 'cover', content: 'cover-image'}}]});
+  }
   return metadata
 }
 
@@ -152,9 +238,15 @@ Streampub.prototype._generateManifest = function () {
   var manifest = []
   // epub2: <item href="toc.ncx" id="ncx" media-type="application/x-dtbncx+xml" />
   // epub3: <item href="toc.xhtml" id="nav" properties="nav" media-type: "application/xhtml+xml" />
-  manifest.push({'item': [{_attr: {id: 'nav', href: 'toc.xhtml', properties: 'nav', 'media-type': 'application/xhtml+xml'}}]})
+  var item
+  manifest.push({'item': [{_attr: {id: 'nav', href: 'toc.xhtml', properties: 'nav', 'media-type': MIME_XHTML}}]})
   this.files.forEach(function (file) {
-    manifest.push({'item': [{_attr: {id: file.id, href: file.fileName, 'media-type': file.mime}}]})
+    item = {'item': [{_attr: {id: file.id, href: file.fileName, 'media-type': file.mime}}]};
+    if(file.id === TYPE_COVER_IMAGE) {
+      manifest.unshift(item)
+    } else {
+      manifest.push(item)
+    }
   })
   return manifest
 }
@@ -162,7 +254,11 @@ Streampub.prototype._generateManifest = function () {
 Streampub.prototype._generateSpine = function () {
   var spine = []
   this.files.forEach(function (file) {
-    spine.push({'itemref': [{_attr: {idref: file.id}}]})
+    if(file.chapterName) {
+      spine.push({'itemref': [{_attr: {idref: file.id}}]})
+    } else if(file.id === TYPE_COVER) {
+      spine.unshift({'itemref': [{_attr: {idref: file.id, linear: 'no'}}]})
+    }
   })
   return spine
 }
